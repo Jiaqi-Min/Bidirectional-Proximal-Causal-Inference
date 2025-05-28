@@ -1,0 +1,250 @@
+---
+title: "Main Estimation Results"
+author: "Jiaqi Min"
+date: "2025-05-22"
+output: html_document
+---
+
+# Load necessary libraries
+```{r}
+library(readr)
+library(foreach)
+library(doParallel)     
+library(MASS)
+```
+
+```{r}
+set.seed(123)
+```
+
+```{r}
+data <- read_csv("Data/levitt20.csv")
+
+selected_vars <- c("year", "fips", "murder_rate", "ear_murd", "afdc15", "prison", "population", "unemp", "income", "pover")
+
+data_selected <- data[selected_vars]
+
+original_vars <- colnames(data_selected)
+
+new_colnames <- c(
+  "year",
+  "fips",
+  "Y",                 # murder_rate
+  "X",                 # ear_murd
+  "Z",                 # afdc15
+  "W",                 # prison
+  paste0("V", 1:4)     # V1-V4: remaining covariates
+)
+
+data_clean <- na.omit(data_selected)
+
+colnames(data_clean) <- new_colnames
+
+data <- data_clean
+
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+data$Z <- standardize(data$Z)
+data$V1 <- standardize(data$V1)
+```
+
+```{r}
+Bi_TSLS <- function(data){
+  V_names <- paste0("V", 1:4)
+  V_terms <- paste(V_names, collapse = " + ")
+  
+  ZV_interactions <- paste("Z:", V_names, collapse = " + ")
+  WV_interactions <- paste("W:", V_names, collapse = " + ")
+  
+  formula_W <- as.formula(paste("W ~ Z +", V_terms, "+", ZV_interactions))
+  formula_Z <- as.formula(paste("Z ~ W +", V_terms, "+", WV_interactions))
+  
+  fit_W <- lm(formula_W, data = data)
+  fit_Z <- lm(formula_Z, data = data)
+  
+  formula_X_Z <- as.formula(paste("X ~ Z + fit_W$fitted.values +", V_terms))
+  formula_Y_Z <- as.formula(paste("Y ~ Z + fit_W$fitted.values +", V_terms))
+  formula_X_W <- as.formula(paste("X ~ fit_Z$fitted.values + W +", V_terms))
+  formula_Y_W <- as.formula(paste("Y ~ fit_Z$fitted.values + W +", V_terms))
+  
+  lm_X_Z <- lm(formula_X_Z, data = data)
+  lm_Y_Z <- lm(formula_Y_Z, data = data)
+  lm_X_W <- lm(formula_X_W, data = data)
+  lm_Y_W <- lm(formula_Y_W, data = data)
+
+  beta_yx_Bi_TSLS <- coef(lm_X_W)["W"] / coef(lm_Y_W)["W"]
+  beta_xy_Bi_TSLS <- coef(lm_Y_Z)["Z"] / coef(lm_X_Z)["Z"]
+  
+  return(c(beta_xy_Bi_TSLS, beta_yx_Bi_TSLS))
+}
+
+IV_estimation <- function(data){
+  V_terms <- paste(paste0("V", 1:4), collapse = " + ")
+  
+  formula_x <- as.formula(paste("X ~ Z + W +", V_terms))
+  formula_y <- as.formula(paste("Y ~ Z + W +", V_terms))
+  
+  model_x <- lm(formula_x, data = data)
+  model_y <- lm(formula_y, data = data)
+  
+  beta_xy_iv <- coef(model_y)["Z"] / coef(model_x)["Z"]
+  beta_yx_iv <- coef(model_x)["W"] / coef(model_y)["W"]
+  
+  return(c(beta_xy_iv, beta_yx_iv))
+}
+
+OLS_estimation <- function(data){
+  V_terms <- paste(paste0("V", 1:4), collapse = " + ")
+  
+  formula_x <- as.formula(paste("X ~ Y + Z + W +", V_terms))
+  formula_y <- as.formula(paste("Y ~ X + Z + W +", V_terms))
+  
+  model_x <- lm(formula_x, data = data)
+  model_y <- lm(formula_y, data = data)
+  
+  beta_xy_ols <- coef(model_y)["X"]
+  beta_yx_ols <- coef(model_x)["Y"]
+  
+  return(c(beta_xy_ols, beta_yx_ols))
+}
+
+algorithm_list <- list(
+  OLS = OLS_estimation,
+  IV = IV_estimation,
+  Bi_TSLS = Bi_TSLS
+)
+```
+
+# Compare different algorithms using simulations
+```{r}
+compare_algorithm <- function(data, algorithm, num_iterations = 500) {
+  cl <- makeCluster(detectCores())
+  registerDoParallel(cl)
+  
+  clusterExport(cl, c("algorithm_list",
+                      "Bi_TSLS", 
+                      "OLS_estimation", "IV_estimation"))
+  
+  results <- foreach(i = 1:num_iterations, .combine = 'cbind', 
+                     .packages = c("MASS", "splines")) %dopar% {
+    selected_algorithm <- algorithm_list[[algorithm]]
+    
+    set.seed(123 + i)
+    bootstrap_indices <- sample(1:nrow(data), size = nrow(data), replace = TRUE)
+    bootstrap_data <- data[bootstrap_indices, ]
+    
+    result <- selected_algorithm(bootstrap_data)
+    
+    result
+  }
+  
+  stopCluster(cl)
+  return(results)
+}
+
+results <- list()
+for (alg in names(algorithm_list)) {
+  results[[alg]] <- compare_algorithm(
+    data = data, 
+    algorithm = alg,
+    num_iterations = 500
+  )
+}
+
+calculate_stats <- function(results) {
+  stats_table <- data.frame(
+    Method = character(),
+    X_to_Y_Estimate = numeric(),
+    X_to_Y_SE = numeric(),
+    X_to_Y_CI_Lower = numeric(),
+    X_to_Y_CI_Upper = numeric(),
+    Y_to_X_Estimate = numeric(),
+    Y_to_X_SE = numeric(),
+    Y_to_X_CI_Lower = numeric(),
+    Y_to_X_CI_Upper = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  remove_extreme_outliers <- function(x) {
+    qnt <- quantile(x, probs = c(.05, .95), na.rm = TRUE)
+    y <- x
+    y[x < qnt[1]] <- NA
+    y[x > qnt[2]] <- NA
+    return(y)
+  }
+  
+  for (alg_name in names(results)) {
+    current_data <- results[[alg_name]]
+    
+    beta_XY <- current_data[1, ]
+    beta_XY_cleaned <- remove_extreme_outliers(beta_XY)
+    mean_XY <- mean(beta_XY_cleaned, na.rm = TRUE)
+    se_XY <- sd(beta_XY_cleaned, na.rm = TRUE) / sqrt(sum(!is.na(beta_XY_cleaned)))
+    ci_XY_lower <- quantile(beta_XY_cleaned, 0.025, na.rm = TRUE)
+    ci_XY_upper <- quantile(beta_XY_cleaned, 0.975, na.rm = TRUE)
+    
+    beta_YX <- current_data[2, ]
+    beta_YX_cleaned <- remove_extreme_outliers(beta_YX)
+    mean_YX <- mean(beta_YX_cleaned, na.rm = TRUE)
+    se_YX <- sd(beta_YX_cleaned, na.rm = TRUE) / sqrt(sum(!is.na(beta_YX_cleaned)))
+    ci_YX_lower <- quantile(beta_YX_cleaned, 0.025, na.rm = TRUE)
+    ci_YX_upper <- quantile(beta_YX_cleaned, 0.975, na.rm = TRUE)
+    
+    display_name <- ifelse(alg_name == "Bi_TSLS", "Bi-TSLS", alg_name)
+    stats_table <- rbind(stats_table, data.frame(
+      Method = display_name,
+      X_to_Y_Estimate = mean_XY,
+      X_to_Y_SE = se_XY,
+      X_to_Y_CI_Lower = ci_XY_lower,
+      X_to_Y_CI_Upper = ci_XY_upper,
+      Y_to_X_Estimate = mean_YX,
+      Y_to_X_SE = se_YX,
+      Y_to_X_CI_Lower = ci_YX_lower,
+      Y_to_X_CI_Upper = ci_YX_upper
+    ))
+  }
+  
+  return(stats_table)
+}
+
+stats_table <- calculate_stats(results)
+
+print_latex_table <- function(stats) {
+  cat("\\begin{table}[ht]\n")
+  cat("\\centering\n")
+  cat("\\resizebox{0.8\\textwidth}{!}{%\n")
+  cat("\\begin{tabular}{cccccccc}\n")
+  cat("\\toprule\n")
+  
+  cat("\\multirow{2}{*}{Method} & \\multicolumn{3}{c}{Causal Effect $\\hat\\beta_{x\\to y}$} &  & \\multicolumn{3}{c}{Causal Effect $\\hat\\beta_{y\\to x}$} \\\\ \\cline{2-4} \\cline{6-8} \\addlinespace[1mm]\n")
+  cat("& Estimate        & SE       & 95\\%CI       &  & Estimate        & SE       & 95\\%CI       \\\\ \\hline\\addlinespace[1mm]\n")
+  
+  for (i in 1:nrow(stats)) {
+    cat(sprintf(
+      "%s & %.3f & %.3f & (%.3f, %.3f) &  & %.3f & %.3f & (%.3f, %.3f) \\\\\n",
+      stats$Method[i],
+      stats$X_to_Y_Estimate[i],
+      stats$X_to_Y_SE[i],
+      stats$X_to_Y_CI_Lower[i],
+      stats$X_to_Y_CI_Upper[i],
+      stats$Y_to_X_Estimate[i],
+      stats$Y_to_X_SE[i],
+      stats$Y_to_X_CI_Lower[i],
+      stats$Y_to_X_CI_Upper[i]
+    ))
+  }
+  
+  cat("\\bottomrule\n")
+  cat("\\end{tabular}%\n")
+  cat("}\n")
+  cat("\\caption{Real data analysis for bidirectional causal effect between abortion and murder rates.}\n")
+  cat("\\label{tab:all state}\n")
+  cat("\\end{table}\n")
+}
+
+print_latex_table(stats_table)
+
+write.csv(stats_table, "causal_effects_results.csv", row.names = FALSE)
+```

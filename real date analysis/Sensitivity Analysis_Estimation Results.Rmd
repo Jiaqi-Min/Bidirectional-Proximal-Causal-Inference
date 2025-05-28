@@ -1,0 +1,268 @@
+---
+title: "Sensitivity Analysis Estimation Results"
+author: "Jiaqi Min"
+date: "2025-05-22"
+output: html_document
+---
+
+# Load necessary libraries
+```{r}
+library(readr)
+library(foreach)
+library(doParallel)     
+library(MASS)          
+library(ggplot2)         
+library(dplyr)
+library(tidyr)
+library(scales)
+```
+
+```{r}
+set.seed(123)
+```
+
+```{r}
+data <- read_csv("Data/levitt20.csv")
+
+selected_vars <- c("murder_rate", "ear_murd", "afdc15", "prison", "population", "unemp", "income", "pover")
+
+data_selected <- data[selected_vars]
+
+# Rename columns
+new_colnames <- c(
+  "Y",                 # murder_rate
+  "X",                 # ear_murd
+  "Z",                 # afdc15
+  "W",                 # prison
+  paste0("V", 1:4)    # V1-V4: control variables
+)
+
+data_clean <- na.omit(data_selected)
+colnames(data_clean) <- new_colnames
+data <- data_clean
+
+# Standardize variables
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+data$Z <- standardize(data$Z)
+data$V1 <- standardize(data$V1)
+```
+
+```{r}
+Bi_TSLS <- function(data, R_w, R_z){
+  V_names <- paste0("V", 1:4)
+  V_terms <- paste(V_names, collapse = " + ")
+  
+  ZV_interactions <- paste("Z:", V_names, collapse = " + ")
+  WV_interactions <- paste("W:", V_names, collapse = " + ")
+  
+  formula_W <- as.formula(paste("W ~ Z +", V_terms, "+", ZV_interactions))
+  formula_Z <- as.formula(paste("Z ~ W +", V_terms, "+", WV_interactions))
+  
+  fit_W <- lm(formula_W, data = data)
+  fit_Z <- lm(formula_Z, data = data)
+  
+  formula_X_Z <- as.formula(paste("X ~ Z + fit_W$fitted.values +", V_terms))
+  formula_Y_Z <- as.formula(paste("Y ~ Z + fit_W$fitted.values +", V_terms))
+  formula_X_W <- as.formula(paste("X ~ fit_Z$fitted.values + W +", V_terms))
+  formula_Y_W <- as.formula(paste("Y ~ fit_Z$fitted.values + W +", V_terms))
+  
+  lm_X_Z <- lm(formula_X_Z, data = data)
+  lm_Y_Z <- lm(formula_Y_Z, data = data)
+  lm_X_W <- lm(formula_X_W, data = data)
+  lm_Y_W <- lm(formula_Y_W, data = data)
+
+  k1 <- coef(lm_X_W)["W"] / coef(lm_Y_W)["W"]
+  k2 <- coef(lm_Y_Z)["Z"] / coef(lm_X_Z)["Z"]
+  
+  beta_xy_Bi_TSLS <- ((k2 * (1 + k1 * R_z - R_w * R_z)) - R_z) / (1 - k1 * k2 * R_w * R_z)
+  beta_yx_Bi_TSLS <- ((k1 * (1 + k2 * R_w - R_w * R_z)) - R_w) / (1 - k1 * k2 * R_w * R_z)
+  return(c(beta_xy_Bi_TSLS, beta_yx_Bi_TSLS))
+}
+
+IV_estimation <- function(data, R_w, R_z){
+  V_terms <- paste(paste0("V", 1:4), collapse = " + ")
+  
+  formula_x <- as.formula(paste("X ~ Z + W +", V_terms))
+  formula_y <- as.formula(paste("Y ~ Z + W +", V_terms))
+  
+  model_x <- lm(formula_x, data = data)
+  model_y <- lm(formula_y, data = data)
+  
+  beta_xy_iv <- coef(model_y)["Z"] / coef(model_x)["Z"]
+  beta_yx_iv <- coef(model_x)["W"] / coef(model_y)["W"]
+  
+  return(c(beta_xy_iv, beta_yx_iv))
+}
+
+OLS_estimation <- function(data, R_w, R_z){
+  V_terms <- paste(paste0("V", 1:4), collapse = " + ")
+  
+  formula_x <- as.formula(paste("X ~ Y + Z + W +", V_terms))
+  formula_y <- as.formula(paste("Y ~ X + Z + W +", V_terms))
+  
+  model_x <- lm(formula_x, data = data)
+  model_y <- lm(formula_y, data = data)
+  
+  beta_xy_ols <- coef(model_y)["X"]
+  beta_yx_ols <- coef(model_x)["Y"]
+  
+  return(c(beta_xy_ols, beta_yx_ols))
+}
+
+algorithm_list <- list(
+  OLS = OLS_estimation,
+  IV = IV_estimation,
+  Bi_TSLS = Bi_TSLS
+)
+```
+
+# Compare different algorithms using simulations
+```{r}
+R_combinations <- list()
+for(i in 0:10) {  
+  R_w_val <- -0.5 + i * 0.1  
+  R_z_val <- 0.5 - i * 0.1   
+  R_combinations[[i+1]] <- c(R_w = R_w_val, R_z = R_z_val)
+}
+
+compare_algorithm_with_R <- function(data, algorithm, num_iterations = 500) {
+  cl <- makeCluster(detectCores())
+  registerDoParallel(cl)
+  
+  clusterExport(cl, c("algorithm_list", "Bi_TSLS", "OLS_estimation", "IV_estimation", "R_combinations"))
+  
+  all_results <- list()
+  
+  for (r_idx in seq_along(R_combinations)) {
+    R_w <- R_combinations[[r_idx]]["R_w"]
+    R_z <- R_combinations[[r_idx]]["R_z"]
+    
+    results <- foreach(i = 1:num_iterations, .combine = 'cbind', 
+                       .packages = c("MASS", "splines")) %dopar% {
+      selected_algorithm <- algorithm_list[[algorithm]]
+      
+      set.seed(123 + i)
+      bootstrap_indices <- sample(1:nrow(data), size = nrow(data), replace = TRUE)
+      bootstrap_data <- data[bootstrap_indices, ]
+      
+      result <- selected_algorithm(bootstrap_data, R_w, R_z)
+      
+      result
+    }
+    
+    all_results[[r_idx]] <- results
+  }
+  
+  stopCluster(cl)
+  return(all_results)
+}
+
+bi_tsls_results <- compare_algorithm_with_R(
+  data = data, 
+  algorithm = "Bi_TSLS",
+  num_iterations = 500
+)
+```
+
+```{r}
+df <- data.frame()
+for (r_idx in seq_along(R_combinations)) {
+  current_data <- bi_tsls_results[[r_idx]]
+  
+  temp_df <- data.frame(
+    R_w = R_combinations[[r_idx]]["R_w"],
+    R_z = R_combinations[[r_idx]]["R_z"],
+    R_idx = r_idx - 1, 
+    beta_XY = current_data[1, ],
+    beta_YX = current_data[2, ],
+    row.names = NULL  
+  )
+  df <- rbind(df, temp_df)
+}
+
+remove_extreme_outliers <- function(x) {
+  qnt <- quantile(x, probs = c(.05, .95), na.rm = TRUE)
+  y <- x
+  y[x < qnt[1]] <- NA
+  y[x > qnt[2]] <- NA
+  return(y)
+}
+
+df_cleaned <- df %>%
+  group_by(R_w, R_z) %>%
+  mutate(beta_XY = remove_extreme_outliers(beta_XY),
+         beta_YX = remove_extreme_outliers(beta_YX)) %>%
+  drop_na() %>%
+  ungroup()
+
+plot_bi_tsls_strength <- function(df_cleaned, direction) {
+  beta_col <- ifelse(direction == "XY", "beta_XY", "beta_YX")
+  
+
+  main_title <- if (direction == "XY") {
+    bquote(hat(beta)[X %->% Y]^s ~ "across different levels of proxy structural conditions violation")
+  } else {
+    bquote(hat(beta)[Y %->% X]^s ~ "across different levels of proxy structural conditions violation")
+  }
+  
+  df_cleaned$R_w <- as.factor(df_cleaned$R_w)
+  
+  base_theme <- theme_minimal(base_size = 20) +
+    theme(
+      panel.background = element_rect(fill = "#F5F5F5"),
+      panel.grid.major = element_line(color = "lightgray"),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black"),
+      legend.position = "none",
+      axis.text = element_text(size = 12),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 20)
+    )
+
+  summary_data <- df_cleaned %>%
+    group_by(R_w) %>%
+    summarize(
+      mean_val = mean(!!sym(beta_col), na.rm = TRUE),
+      min_val = min(!!sym(beta_col), na.rm = TRUE),
+      max_val = max(!!sym(beta_col), na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  p <- ggplot(summary_data, aes(x = R_w)) +
+    geom_errorbar(aes(ymin = min_val, ymax = max_val), 
+                  width = 0.2, color = "black", linewidth = 0.7) +
+    geom_point(aes(y = mean_val), color = "#E74C3C", size = 3) +
+    scale_x_discrete(
+      name = bquote("Values of" ~ R[w] ~ "and" ~ -R[z]),
+      labels = as.character(seq(-0.5, 0.5, by = 0.1))
+    ) +
+    scale_y_continuous(
+      name = "Effect estimates",
+      labels = scales::label_number(accuracy = 0.01)
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    base_theme +
+    labs(title = main_title)
+  
+  return(p)
+}
+
+p_XY <- plot_bi_tsls_strength(df_cleaned, "XY")
+p_YX <- plot_bi_tsls_strength(df_cleaned, "YX")
+
+combined_plot <- grid.arrange(p_XY, p_YX, ncol = 2)
+
+ggsave(
+  filename = "Combined_Bi_TSLS_Strength_plots.eps",
+  plot     = combined_plot,
+  device   = "eps",
+  width    = 20,
+  height   = 6,
+  units    = "in",
+  dpi      = 300
+)
+```

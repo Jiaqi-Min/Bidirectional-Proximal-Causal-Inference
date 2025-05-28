@@ -1,0 +1,288 @@
+---
+title: "Simulation for Different Methods"
+author: "Jiaqi Min"
+date: "2025-05-22"
+output: html_document
+---
+
+# Load required R packages
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(gridExtra)
+```
+
+# Data loading
+```{r}
+set.seed(123)
+data <- readRDS("Simulation Data/iterations_200.rds")
+```
+
+```{r}
+scenarios <- c("a", "b", "c")
+
+alpha_gamma_combinations <- list(
+  c(alpha_u = 0, gamma_u = 0),
+  c(alpha_u = 0.05, gamma_u = -0.05),
+  c(alpha_u = 0.5, gamma_u = -0.5),
+  c(alpha_u = 1, gamma_u = -1)
+)
+
+Ns <- c(1000, 2000, 5000)
+```
+
+# Define simulation algorithms
+```{r}
+Bi_TSLS <- function(data){
+  fit_W <- lm(W ~ Z + V + I(Z * V), data = data)
+  fit_Z <- lm(Z ~ W + V + I(W * V), data = data)
+
+  lm_X_Z <- lm(X ~ Z + fit_W$fitted.values + V, data = data)
+  lm_Y_Z <- lm(Y ~ Z + fit_W$fitted.values + V, data = data)
+
+  lm_X_W <- lm(X ~ fit_Z$fitted.values + W + V, data = data)
+  lm_Y_W <- lm(Y ~ fit_Z$fitted.values + W + V, data = data)
+
+  beta_xy_Bi_TSLS <- coef(lm_Y_Z)["Z"] / coef(lm_X_Z)["Z"]
+  beta_yx_Bi_TSLS <- coef(lm_X_W)["W"] / coef(lm_Y_W)["W"]
+  
+  return(c(beta_xy_Bi_TSLS, beta_yx_Bi_TSLS))
+}
+
+IV_estimation <- function(data){
+  model_x <- lm(X ~ Z + W + V, data = data)
+  model_y <- lm(Y ~ Z + W + V, data = data)
+  
+  beta_xy_iv <- coef(model_y)["Z"] / coef(model_x)["Z"]
+  beta_yx_iv <- coef(model_x)["W"] / coef(model_y)["W"]
+  
+  return(c(beta_xy_iv, beta_yx_iv))
+}
+
+OLS_estimation <- function(data){
+  model_x <- lm(X ~ Y + Z + W + V, data = data)
+  model_y <- lm(Y ~ X + Z + W + V, data = data)
+
+  beta_xy_ols <- coef(model_y)["X"]
+  beta_yx_ols <- coef(model_x)["Y"]
+  
+  return(c(beta_xy_ols, beta_yx_ols))
+}
+
+algorithm_list <- list(
+  OLS = OLS_estimation,
+  IV = IV_estimation,
+  Bi_TSLS = Bi_TSLS
+)
+```
+
+```{r}
+alpha_gamma_values <- c(alpha_u = 0.5, gamma_u = -0.5)
+
+process_all_iterations <- function(all_iterations) {
+  scenarios <- c("a", "b", "c")
+  total_steps <- length(all_iterations)
+  
+  pb <- txtProgressBar(max = total_steps, style = 3)
+  
+  combined_results <- list()
+  
+  for(scenario in scenarios) {
+    combined_results[[scenario]] <- list()
+    combo_key <- paste0("alpha_u_", alpha_gamma_values["alpha_u"], 
+                       "_gamma_u_", alpha_gamma_values["gamma_u"])
+    combined_results[[scenario]][[combo_key]] <- list()
+    
+    for(n_size in Ns) {
+      n_key <- paste0("N_", n_size)
+      combined_results[[scenario]][[combo_key]][[n_key]] <- list()
+    }
+  }
+  
+  first_iter <- 1
+  for(scenario in scenarios) {
+    combo_key <- paste0("alpha_u_", alpha_gamma_values["alpha_u"], 
+                       "_gamma_u_", alpha_gamma_values["gamma_u"])
+    
+    for(n_size in Ns) {
+      n_key <- paste0("N_", n_size)
+      current_data <- all_iterations[[first_iter]][[scenario]][[combo_key]][[n_key]]
+      
+      for(alg_name in names(algorithm_list)) {
+        current_alg <- algorithm_list[[alg_name]]
+        result <- current_alg(current_data)
+        
+        if(is.matrix(result)) {
+          combined_results[[scenario]][[combo_key]][[n_key]][[alg_name]] <- 
+            array(NA, dim = c(nrow(result), ncol(result), length(all_iterations)))
+        } else {
+          combined_results[[scenario]][[combo_key]][[n_key]][[alg_name]] <- 
+            matrix(NA, nrow = length(result), ncol = length(all_iterations))
+        }
+        
+        if(is.matrix(result)) {
+          combined_results[[scenario]][[combo_key]][[n_key]][[alg_name]][,,first_iter] <- result
+        } else {
+          combined_results[[scenario]][[combo_key]][[n_key]][[alg_name]][,first_iter] <- result
+        }
+      }
+    }
+  }
+  
+  setTxtProgressBar(pb, 1)
+  
+  for(iter in 2:length(all_iterations)) {
+    for(scenario in scenarios) {
+      combo_key <- paste0("alpha_u_", alpha_gamma_values["alpha_u"], 
+                         "_gamma_u_", alpha_gamma_values["gamma_u"])
+      
+      for(n_size in Ns) {
+        n_key <- paste0("N_", n_size)
+        current_data <- all_iterations[[iter]][[scenario]][[combo_key]][[n_key]]
+        
+        for(alg_name in names(algorithm_list)) {
+          current_alg <- algorithm_list[[alg_name]]
+          result <- current_alg(current_data)
+          
+          if(is.matrix(result)) {
+            combined_results[[scenario]][[combo_key]][[n_key]][[alg_name]][,,iter] <- result
+          } else {
+            combined_results[[scenario]][[combo_key]][[n_key]][[alg_name]][,iter] <- result
+          }
+        }
+      }
+    }
+    
+    setTxtProgressBar(pb, iter)
+  }
+  
+  close(pb)
+  return(combined_results)
+}
+
+results <- process_all_iterations(data)
+```
+
+# Transform simulation results into a data frame for plotting
+```{r}
+remove_extreme_outliers <- function(x) {
+  qnt <- quantile(x, probs = c(.05, .95), na.rm = TRUE)
+  y <- x
+  y[x < qnt[1]] <- NA
+  y[x > qnt[2]] <- NA
+  return(y)
+}
+
+df <- data.frame()
+for (scenario in names(results)) {
+  for (ag_comb in names(results[[scenario]])) {
+    for (n in names(results[[scenario]][[ag_comb]])) {
+      N_value <- as.numeric(gsub("N_", "", n))
+      for (alg_name in names(results[[scenario]][[ag_comb]][[n]])) {
+        current_data <- results[[scenario]][[ag_comb]][[n]][[alg_name]]
+        temp_df <- data.frame(
+          scenario = scenario,
+          ag_comb = ag_comb,
+          N = N_value,
+          algorithm = alg_name,
+          beta_XY = current_data[1,],
+          beta_YX = current_data[2,]
+        )
+        df <- rbind(df, temp_df)
+      }
+    }
+  }
+}
+
+df_cleaned <- df %>%
+  group_by(scenario, ag_comb, algorithm, N) %>%
+  mutate(beta_XY = remove_extreme_outliers(beta_XY),
+         beta_YX = remove_extreme_outliers(beta_YX)) %>%
+  drop_na() %>%
+  ungroup()
+
+plot_results <- function(df_cleaned, direction) {
+  beta_col <- ifelse(direction == "X to Y", "beta_XY", "beta_YX")
+  true_value <- ifelse(direction == "X to Y", 0.5, -0.5)
+  
+  main_title <- if(direction == "X to Y") {
+    bquote(hat(beta)[X %->% Y] ~ "across different sample sizes and methods")
+  } else {
+    bquote(hat(beta)[Y %->% X] ~ "across different sample sizes and methods")
+  }
+  
+  ag_values <- str_match(df_cleaned$ag_comb[1], 
+                        "alpha_u_(.+)_gamma_u_(.+)") 
+  subtitle_text <- bquote(alpha[u] == .(ag_values[2]) ~ ";" ~ 
+                         gamma[u] == .(ag_values[3]))
+  
+  df_cleaned$scenario <- factor(df_cleaned$scenario, 
+                              levels = c("a", "b", "c"),
+                              labels = c("Scenario (a)", "Scenario (b)", "Scenario (c)"))
+  df_cleaned$algorithm <- factor(df_cleaned$algorithm, 
+                               levels = c("OLS", "IV", "Bi_TSLS"))
+  df_cleaned$N <- factor(df_cleaned$N)
+  
+  p <- ggplot(df_cleaned, aes(x = N, y = !!sym(beta_col), fill = algorithm)) +
+    stat_boxplot(geom ='errorbar', width = 0.4, position = position_dodge(width = 0.7)) +
+    stat_boxplot(geom = "boxplot", position = position_dodge(width = 0.7), width = 0.6, 
+                outlier.shape = NA) +
+    geom_hline(yintercept = true_value, linetype = "dashed", color = "black", linewidth = 0.5) +
+    facet_wrap(~scenario, nrow = 1) +
+    scale_x_discrete(name = "Sample sizes", expand = expansion(add = c(0.5, 0.5))) +
+    scale_y_continuous(name = "Effect estimates", labels = scales::label_number(accuracy = 0.01)) +
+    scale_fill_manual(values = c("#a6cee3", "#b2df8a", "#fb9a99"),
+                     labels = c("OLS", "IV", "Bi-TSLS")) +
+    theme_minimal(base_size = 20) +
+    theme(
+      panel.background = element_rect(fill = "#F5F5F5"),
+      panel.grid.major = element_line(colour = "lightgray"),
+      panel.grid.minor = element_blank(),
+      axis.line        = element_line(colour = "black"),
+      axis.text.x      = element_text(angle = 45, hjust = 1),
+      axis.title       = element_text(size = 25),
+      axis.text        = element_text(size = 12),
+      legend.position  = "right",
+      legend.title     = element_blank(),
+      strip.text       = element_text(size = 14),
+      plot.title       = element_text(size = 25, face = "bold", hjust = 0.5),
+      plot.subtitle    = element_text(size = 20, hjust = 0.5),  
+      plot.margin      = margin(10, 20, 10, 20)
+    ) +
+    labs(title = main_title, subtitle = subtitle_text) +
+    coord_cartesian(clip = "off")
+  
+  ggsave(
+    filename = paste0("Iteration_", direction, "_", df_cleaned$ag_comb[1], ".eps"),
+    plot     = p,
+    device   = "eps",
+    width    = 18,
+    height   = 6,
+    units    = "in",
+    dpi      = 300
+  )
+  return(p)
+}
+
+plot_results(df_cleaned, "X to Y")
+plot_results(df_cleaned, "Y to X")
+
+p1 <- plot_results(df_cleaned, "X to Y")
+p2 <- plot_results(df_cleaned, "Y to X")
+
+ag_comb_name <- df_cleaned$ag_comb[1]
+combined_plot <- grid.arrange(p1, p2, nrow = 2)
+
+ggsave(
+  filename = paste0("Combined_Plots_", ag_comb_name, ".eps"),
+  plot = combined_plot,
+  device = "eps",
+  width = 18,
+  height = 12,  # 增加高度以容纳两个图
+  units = "in",
+  dpi = 300
+)
+```
+
