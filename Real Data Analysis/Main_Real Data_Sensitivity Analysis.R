@@ -1,12 +1,3 @@
----
-title: "Sensitivity Analysis Estimation Results"
-author: "Jiaqi Min"
-date: "2025-05-22"
-output: html_document
----
-
-# Load necessary libraries
-```{r}
 library(readr)
 library(foreach)
 library(doParallel)     
@@ -15,42 +6,27 @@ library(ggplot2)
 library(dplyr)
 library(tidyr)
 library(scales)
-```
+library(gridExtra)
 
-```{r}
 set.seed(123)
-```
 
-```{r}
-data <- read_csv("Data/levitt20.csv")
+data <- read_csv("levitt20.csv")
 
 selected_vars <- c("murder_rate", "ear_murd", "afdc15", "prison", "population", "unemp", "income", "pover")
-
 data_selected <- data[selected_vars]
 
-# Rename columns
-new_colnames <- c(
-  "Y",                 # murder_rate
-  "X",                 # ear_murd
-  "Z",                 # afdc15
-  "W",                 # prison
-  paste0("V", 1:4)    # V1-V4: control variables
-)
-
+new_colnames <- c("Y", "X", "Z", "W", paste0("V", 1:4))
 data_clean <- na.omit(data_selected)
 colnames(data_clean) <- new_colnames
 data <- data_clean
 
-# Standardize variables
 standardize <- function(x) {
   (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
 }
 
 data$Z <- standardize(data$Z)
 data$V1 <- standardize(data$V1)
-```
 
-```{r}
 Bi_TSLS <- function(data, R_w, R_z){
   V_names <- paste0("V", 1:4)
   V_terms <- paste(V_names, collapse = " + ")
@@ -77,9 +53,10 @@ Bi_TSLS <- function(data, R_w, R_z){
   k1 <- coef(lm_X_W)["W"] / coef(lm_Y_W)["W"]
   k2 <- coef(lm_Y_Z)["Z"] / coef(lm_X_Z)["Z"]
   
-  beta_xy_Bi_TSLS <- ((k2 * (1 + k1 * R_z - R_w * R_z)) - R_z) / (1 - k1 * k2 * R_w * R_z)
-  beta_yx_Bi_TSLS <- ((k1 * (1 + k2 * R_w - R_w * R_z)) - R_w) / (1 - k1 * k2 * R_w * R_z)
-  return(c(beta_xy_Bi_TSLS, beta_yx_Bi_TSLS))
+  beta_xy <- ((k2 * (1 + k1 * R_z - R_w * R_z)) - R_z) / (1 - k1 * k2 * R_w * R_z)
+  beta_yx <- ((k1 * (1 + k2 * R_w - R_w * R_z)) - R_w) / (1 - k1 * k2 * R_w * R_z)
+  
+  return(c(beta_xy = as.numeric(beta_xy), beta_yx = as.numeric(beta_yx)))
 }
 
 IV_estimation <- function(data, R_w, R_z){
@@ -91,10 +68,10 @@ IV_estimation <- function(data, R_w, R_z){
   model_x <- lm(formula_x, data = data)
   model_y <- lm(formula_y, data = data)
   
-  beta_xy_iv <- coef(model_y)["Z"] / coef(model_x)["Z"]
-  beta_yx_iv <- coef(model_x)["W"] / coef(model_y)["W"]
+  beta_xy <- coef(model_y)["Z"] / coef(model_x)["Z"]
+  beta_yx <- coef(model_x)["W"] / coef(model_y)["W"]
   
-  return(c(beta_xy_iv, beta_yx_iv))
+  return(c(beta_xy = as.numeric(beta_xy), beta_yx = as.numeric(beta_yx)))
 }
 
 OLS_estimation <- function(data, R_w, R_z){
@@ -106,10 +83,10 @@ OLS_estimation <- function(data, R_w, R_z){
   model_x <- lm(formula_x, data = data)
   model_y <- lm(formula_y, data = data)
   
-  beta_xy_ols <- coef(model_y)["X"]
-  beta_yx_ols <- coef(model_x)["Y"]
+  beta_xy <- coef(model_y)["X"]
+  beta_yx <- coef(model_x)["Y"]
   
-  return(c(beta_xy_ols, beta_yx_ols))
+  return(c(beta_xy = as.numeric(beta_xy), beta_yx = as.numeric(beta_yx)))
 }
 
 algorithm_list <- list(
@@ -117,10 +94,7 @@ algorithm_list <- list(
   IV = IV_estimation,
   Bi_TSLS = Bi_TSLS
 )
-```
 
-# Compare different algorithms using simulations
-```{r}
 R_combinations <- list()
 for(i in 0:10) {  
   R_w_val <- -0.5 + i * 0.1  
@@ -165,9 +139,7 @@ bi_tsls_results <- compare_algorithm_with_R(
   algorithm = "Bi_TSLS",
   num_iterations = 500
 )
-```
 
-```{r}
 df <- data.frame()
 for (r_idx in seq_along(R_combinations)) {
   current_data <- bi_tsls_results[[r_idx]]
@@ -183,25 +155,14 @@ for (r_idx in seq_along(R_combinations)) {
   df <- rbind(df, temp_df)
 }
 
-remove_extreme_outliers <- function(x) {
-  qnt <- quantile(x, probs = c(.05, .95), na.rm = TRUE)
-  y <- x
-  y[x < qnt[1]] <- NA
-  y[x > qnt[2]] <- NA
-  return(y)
-}
-
 df_cleaned <- df %>%
   group_by(R_w, R_z) %>%
-  mutate(beta_XY = remove_extreme_outliers(beta_XY),
-         beta_YX = remove_extreme_outliers(beta_YX)) %>%
   drop_na() %>%
   ungroup()
 
 plot_bi_tsls_strength <- function(df_cleaned, direction) {
   beta_col <- ifelse(direction == "XY", "beta_XY", "beta_YX")
   
-
   main_title <- if (direction == "XY") {
     bquote(hat(beta)[X %->% Y]^s ~ "across different levels of proxy structural conditions violation")
   } else {
@@ -237,7 +198,7 @@ plot_bi_tsls_strength <- function(df_cleaned, direction) {
                   width = 0.2, color = "black", linewidth = 0.7) +
     geom_point(aes(y = mean_val), color = "#E74C3C", size = 3) +
     scale_x_discrete(
-      name = bquote("Values of" ~ R[w] ~ "and" ~ -R[z]),
+      name = bquote("Sensitivity parameter values"),
       labels = as.character(seq(-0.5, 0.5, by = 0.1))
     ) +
     scale_y_continuous(
@@ -257,7 +218,7 @@ p_YX <- plot_bi_tsls_strength(df_cleaned, "YX")
 combined_plot <- grid.arrange(p_XY, p_YX, ncol = 2)
 
 ggsave(
-  filename = "Combined_Bi_TSLS_Strength_plots.eps",
+  filename = "Fig_Main_RealData_Sensitivity.eps",
   plot     = combined_plot,
   device   = "eps",
   width    = 20,
@@ -265,4 +226,3 @@ ggsave(
   units    = "in",
   dpi      = 300
 )
-```
